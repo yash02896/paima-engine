@@ -8,7 +8,7 @@ import {
   Network,
   timeout,
 } from '@paima/utils';
-import type { ChainDataExtensionCardanoProjectedNFT, InternalEvent } from '@paima/sm';
+import type { CardanoPresyncChainData, EvmPresyncChainData, InternalEvent } from '@paima/sm';
 import {
   type ChainData,
   type ChainDataExtension,
@@ -22,13 +22,16 @@ import type { PoolClient } from 'pg';
 import type { ChainFunnel, ReadPresyncDataFrom } from '@paima/runtime';
 import getCdePoolData from '../../cde/cardanoPool.js';
 import getCdeProjectedNFTData from '../../cde/cardanoProjectedNFT.js';
+import getCdeTransferData, { PAGINATION_LIMIT } from '../../cde/cardanoTransfer.js';
 import { query } from '@dcspark/carp-client/client/src/index';
 import { Routes } from '@dcspark/carp-client/shared/routes';
 import { FUNNEL_PRESYNC_FINISHED, InternalEventType } from '@paima/utils/src/constants';
 import { CarpFunnelCacheEntry } from '../FunnelCache.js';
-import { getCardanoEpoch } from '@paima/db';
+import { getCardanoEpoch, getCarpCursors } from '@paima/db';
+import type { BlockTxPair } from 'tmp-carp-client/shared/models/common';
 
 const delayForWaitingForFinalityLoop = 1000;
+const DEFAULT_PRESYNC_SLOT_RANGE = 10000;
 
 type Era = {
   firstSlot: number;
@@ -196,66 +199,226 @@ export class CarpFunnel extends BaseFunnel implements ChainFunnel {
   public override async readPresyncData(
     args: ReadPresyncDataFrom
   ): Promise<{ [network: number]: PresyncChainData[] | typeof FUNNEL_PRESYNC_FINISHED }> {
-    const arg = args.find(arg => arg.network == Network.CARDANO);
-
     let basePromise = this.baseFunnel.readPresyncData(args);
 
-    if (arg && arg.from >= 0 && arg.from < this.cache.getState().startingSlot) {
-      const [carpEvents, data] = await Promise.all([
-        Promise.all(
-          this.sharedData.extensions
-            .filter(
-              extension =>
-                extension.cdeType === ChainDataExtensionType.CardanoPool ||
-                extension.cdeType === ChainDataExtensionType.CardanoProjectedNFT
-            )
-            .map(extension => {
-              if (extension.cdeType === ChainDataExtensionType.CardanoPool) {
+    const stableBlock = await timeout(
+      query(this.carpUrl, Routes.blockLatest, {
+        offset: Number(this.confirmationDepth),
+      }),
+      DEFAULT_FUNNEL_TIMEOUT
+    );
+
+    const cursors = this.cache.getState().cursors;
+
+    const getSlotRange = ({
+      cdeId,
+      startSlot,
+    }: {
+      cdeId: number;
+      startSlot: number;
+    }): { from: number; to: number } => {
+      const cursors = this.cache.getState().cursors;
+      const from: number = (cursors && (cursors[cdeId] as { slot: number }).slot) || startSlot;
+      const to = from + DEFAULT_PRESYNC_SLOT_RANGE;
+
+      // the cache gets invalidated on error, so we can update the cursor before
+      // even returning the event without risk.
+      this.cache.updateCursor(cdeId, {
+        kind: 'slot',
+        slot: to,
+        finished: to >= this.cache.getState().startingSlot,
+      });
+
+      return {
+        from,
+        to,
+      };
+    };
+
+    const [carpEvents, data] = await Promise.all([
+      Promise.all(
+        this.sharedData.extensions
+          .filter(extension => {
+            if (!('startSlot' in extension)) {
+              return false;
+            }
+
+            if (cursors) {
+              const cursor = cursors[extension.cdeId];
+
+              if (!cursor) {
+                return true;
+              }
+
+              return !cursor.finished;
+            } else {
+              return true;
+            }
+          })
+          .map(extension => {
+            switch (extension.cdeType) {
+              case ChainDataExtensionType.CardanoPool: {
+                const { from, to } = getSlotRange(extension);
+
                 const data = getCdePoolData(
                   this.carpUrl,
                   extension,
-                  arg.from,
-                  Math.min(arg.to, this.cache.getState().startingSlot - 1),
+                  from,
+                  Math.min(to, this.cache.getState().startingSlot - 1),
+                  slot => slot,
+                  slot => absoluteSlotToEpoch(this.era, slot)
+                );
+
+                return data.then(data => ({
+                  cdeId: extension.cdeId,
+                  cdeType: extension.cdeType,
+                  data,
+                }));
+              }
+              case ChainDataExtensionType.CardanoProjectedNFT: {
+                const { from, to } = getSlotRange(extension);
+
+                const data = getCdeProjectedNFTData(
+                  this.carpUrl,
+                  extension,
+                  from,
+                  Math.min(to, this.cache.getState().startingSlot - 1),
+                  slot => slot
+                );
+
+                return data.then(data => ({
+                  cdeId: extension.cdeId,
+                  cdeType: extension.cdeType,
+                  data,
+                }));
+              }
+              case ChainDataExtensionType.CardanoTransfer: {
+                const cache = this.cache;
+                const cursors = this.cache.getState().cursors;
+                const startingSlot = this.cache.getState().startingSlot - 1;
+
+                const cursor = cursors && cursors[extension.cdeId];
+
+                const data = getCdeTransferData(
+                  this.carpUrl,
+                  extension,
+                  extension.startSlot,
+                  startingSlot,
                   slot => {
                     return slot;
                   },
-                  slot => absoluteSlotToEpoch(this.era, slot)
-                );
-                return data;
-              } else {
-                // ProjectedNFT
-                const data = getCdeProjectedNFTData(
-                  this.carpUrl,
-                  extension as ChainDataExtensionCardanoProjectedNFT,
-                  arg.from,
-                  Math.min(arg.to, this.cache.getState().startingSlot - 1),
-                  slot => {
-                    return slot;
-                  }
-                );
-                return data;
+                  true,
+                  stableBlock.block.hash,
+                  cursor && cursor.kind === 'paginationCursor'
+                    ? (JSON.parse(cursor.cursor) as BlockTxPair)
+                    : undefined
+                ).then(datums => {
+                  // we are providing the entire indexed range, so if carp
+                  // returns nothing we know the presync is finished for this
+                  // CDE.
+                  const finished = datums.length === 0 || datums.length < PAGINATION_LIMIT;
+
+                  cache.updateCursor(extension.cdeId, {
+                    kind: 'paginationCursor',
+                    cursor: datums[datums.length - 1].paginationCursor.cursor,
+                    finished,
+                  });
+
+                  datums[datums.length - 1].paginationCursor.finished = finished;
+
+                  return datums;
+                });
+
+                return data.then(data => ({
+                  cdeId: extension.cdeId,
+                  cdeType: extension.cdeType,
+                  data,
+                }));
               }
-            })
-        ),
-        basePromise,
-      ]);
+              default:
+                throw new Error('unhandled extension');
+            }
+          })
+      ),
+      basePromise,
+    ]);
 
-      let grouped = groupCdeData(Network.CARDANO, arg.from, arg.to, carpEvents);
+    const list: CardanoPresyncChainData[] = [];
 
-      if (grouped.length > 0) {
-        data[Network.CARDANO] = grouped;
+    for (const events of carpEvents) {
+      if (events.cdeType === ChainDataExtensionType.CardanoTransfer) {
+        for (const event of events.data || []) {
+          list.push({
+            extensionDatums: [event],
+            network: Network.CARDANO,
+            carpCursor: {
+              kind: 'paginationCursor',
+              cdeId: event.cdeId,
+              cursor: event.paginationCursor.cursor,
+              finished: event.paginationCursor.finished,
+            },
+          });
+        }
+      } else {
+        // handle the cde's that are still on slot range based 'pagination' (not
+        // really pagination, but emulated)
+        const cursor = cursors && cursors[events.cdeId];
+        const finished = (cursor && cursor.kind === 'slot' && cursor.finished) || false;
+
+        // add an empty event so that the slot range gets updated even if there
+        // are no events, since it's not a real pagination cursor
+        if (events.data.length === 0) {
+          const slot = (cursor && cursor.kind === 'slot' && cursor.slot) || 0;
+          list.push({
+            extensionDatums: [],
+            network: Network.CARDANO,
+            carpCursor: {
+              kind: 'slot',
+              cdeId: events.cdeId,
+              slot,
+              finished,
+            },
+          });
+        }
+
+        // group by slot by traversing in order, if two consecutive entries have
+        // the same slot then add them to the last entry.
+        //
+        // it's important to group by slot since that's how the 'cursor' is updated.
+        // this code can be removed when we implement pagination by (tx,block).
+        let slot;
+        for (let i = 0; i < events.data.length; i++) {
+          const event = events.data[i];
+          const isLastAndFinished = (i == events.data.length - 1 && finished) || false;
+
+          if (slot && slot === event.blockNumber) {
+            list[list.length - 1].extensionDatums.push(event);
+            list[list.length - 1].carpCursor.finished = isLastAndFinished;
+          } else {
+            slot = event.blockNumber;
+
+            list.push({
+              extensionDatums: [event],
+              network: Network.CARDANO,
+              carpCursor: {
+                kind: 'slot',
+                cdeId: event.cdeId,
+                slot: event.blockNumber,
+                finished: isLastAndFinished,
+              },
+            });
+          }
+        }
       }
-
-      return data;
-    } else {
-      const data = await basePromise;
-
-      if (arg) {
-        data[Network.CARDANO] = FUNNEL_PRESYNC_FINISHED;
-      }
-
-      return data;
     }
+
+    if (cursors && Object.values(cursors).every(x => x.finished)) {
+      data[Network.CARDANO] = FUNNEL_PRESYNC_FINISHED;
+    } else {
+      data[Network.CARDANO] = list;
+    }
+
+    return data;
   }
 
   public static async recoverState(
@@ -292,6 +455,28 @@ export class CarpFunnel extends BaseFunnel implements ChainFunnel {
         newEntry.updateEpoch(epoch[0].epoch);
       }
 
+      const cursors = await getCarpCursors.run(undefined, dbTx);
+
+      for (const cursor of cursors) {
+        const kind = sharedData.extensions.find(extension => extension.cdeId === cursor.cde_id);
+
+        const slotBased = kind?.cdeType !== ChainDataExtensionType.CardanoTransfer;
+
+        if (slotBased) {
+          newEntry.updateCursor(cursor.cde_id, {
+            kind: 'slot',
+            slot: Number(cursor.cursor),
+            finished: cursor.finished,
+          });
+        } else {
+          newEntry.updateCursor(cursor.cde_id, {
+            kind: 'paginationCursor',
+            cursor: cursor.cursor,
+            finished: cursor.finished,
+          });
+        }
+      }
+
       return newEntry;
     })();
 
@@ -314,7 +499,7 @@ async function readDataInternal(
   cache: CarpFunnelCacheEntry,
   confirmationDepth: number,
   era: Era
-): Promise<PresyncChainData[]> {
+): Promise<EvmPresyncChainData[]> {
   // the lower range is exclusive
   const min = timestampToAbsoluteSlot(era, lastTimestamp, confirmationDepth);
   // the upper range is inclusive
@@ -323,6 +508,8 @@ async function readDataInternal(
   const max = timestampToAbsoluteSlot(era, maxElement.timestamp, confirmationDepth);
 
   cache.updateLastPoint(maxElement.blockNumber, maxElement.timestamp);
+
+  let stableBlockId: string;
 
   // Block finality depends on depth, and not on time, so it's possible that a
   // block at a non confirmed depth falls in the slot range that we are querying
@@ -337,6 +524,7 @@ async function readDataInternal(
     );
 
     if (stableBlock.block.slot > max) {
+      stableBlockId = stableBlock.block.hash;
       break;
     }
 
@@ -391,6 +579,19 @@ async function readDataInternal(
           );
 
           return projectedNFTData;
+        case ChainDataExtensionType.CardanoTransfer:
+          const transferData = getCdeTransferData(
+            carpUrl,
+            extension,
+            min,
+            Math.min(max, extension.stopSlot || max),
+            mapSlotToBlockNumber,
+            false, // not presync
+            stableBlockId,
+            undefined // we want everything in the range, so no starting point for the pagination
+          );
+
+          return transferData;
         default:
           return Promise.resolve([]);
       }
@@ -398,7 +599,6 @@ async function readDataInternal(
   );
 
   let grouped = groupCdeData(
-    Network.EVM,
     data[0].blockNumber,
     data[data.length - 1].blockNumber,
     poolEvents.filter(data => data.length > 0)

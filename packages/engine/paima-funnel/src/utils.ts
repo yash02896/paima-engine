@@ -1,13 +1,12 @@
-import type { ChainData, ChainDataExtensionDatum, PresyncChainData } from '@paima/sm';
-import type { Network } from '@paima/utils';
+import type { ChainData, ChainDataExtensionDatum, EvmPresyncChainData } from '@paima/sm';
+import { Network } from '@paima/utils';
 
 export function groupCdeData(
-  network: Network,
   fromBlock: number,
   toBlock: number,
   data: ChainDataExtensionDatum[][]
-): PresyncChainData[] {
-  const result: PresyncChainData[] = [];
+): EvmPresyncChainData[] {
+  const result: EvmPresyncChainData[] = [];
   for (let blockNumber = fromBlock; blockNumber <= toBlock; blockNumber++) {
     const extensionDatums: ChainDataExtensionDatum[] = [];
     for (const dataStream of data) {
@@ -21,7 +20,7 @@ export function groupCdeData(
     result.push({
       blockNumber,
       extensionDatums,
-      network,
+      network: Network.EVM,
     });
   }
   return result;
@@ -29,7 +28,7 @@ export function groupCdeData(
 
 export function composeChainData(
   baseChainData: ChainData[],
-  cdeData: PresyncChainData[]
+  cdeData: EvmPresyncChainData[]
 ): ChainData[] {
   return baseChainData.map(blockData => ({
     ...blockData,

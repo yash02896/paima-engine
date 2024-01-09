@@ -62,83 +62,55 @@ async function runPresync(
     startBlockHeight
   );
 
-  if (!ENV.CARP_URL) {
-    if (presyncBlockHeight[Network.CARDANO] === -1) {
-      delete presyncBlockHeight[Network.CARDANO];
-    } else {
-      throw new Error(
-        '[paima-runtime] Detected Cardano CDE sync in progress, but CARP_URL is not set.'
-      );
-    }
-  }
-
   if (run) {
     doLog('---------------------------\nBeginning Presync\n---------------------------');
   }
-  while (run && Object.keys(presyncBlockHeight).length !== 0) {
-    const upper = Object.fromEntries(
-      Object.entries(presyncBlockHeight)
-        .filter(([_network, h]) => h >= 0)
-        .map(([network, h]) => [network, h + stepSize - 1])
-    );
+  while (run) {
+    const upper = presyncBlockHeight + stepSize - 1;
 
-    if (upper[Network.EVM] > presyncBlockHeight[Network.EVM]) {
+    if (upper > presyncBlockHeight) {
       doLog(`${JSON.stringify(presyncBlockHeight)}-${JSON.stringify(upper)}`);
     } else {
       doLog(`${JSON.stringify(presyncBlockHeight)}`);
     }
 
     // eslint-disable-next-line @typescript-eslint/no-loop-func
-    presyncBlockHeight = await tx(gameStateMachine.getReadWriteDbConn(), async dbTx => {
+    const maybePresyncBlockHeight = await tx(gameStateMachine.getReadWriteDbConn(), async dbTx => {
       const chainFunnel = await funnelFactory.generateFunnel(dbTx);
-      return await runPresyncRound(
-        gameStateMachine,
-        chainFunnel,
-        pollingPeriod,
-        Object.entries(presyncBlockHeight).map(([network, height]) => ({
-          network: Number(network),
-          from: height,
-          to: upper[network],
-        }))
-      );
+      return await runPresyncRound(gameStateMachine, chainFunnel, pollingPeriod, {
+        from: presyncBlockHeight,
+        to: upper,
+      });
     });
+
+    if (maybePresyncBlockHeight) {
+      presyncBlockHeight = maybePresyncBlockHeight;
+    } else {
+      break;
+    }
   }
 
-  await loopIfStopBlockReached(presyncBlockHeight[Network.EVM], stopBlockHeight);
+  await loopIfStopBlockReached(presyncBlockHeight, stopBlockHeight);
 
   const latestPresyncBlockheight = await gameStateMachine.getPresyncBlockHeight();
   doLog(`[paima-runtime] Presync finished at ${latestPresyncBlockheight}`);
-
-  const latestPresyncSlotHeight = await gameStateMachine.getPresyncCardanoSlotHeight();
-  if (latestPresyncSlotHeight > 0) {
-    doLog(`[paima-runtime] Cardano presync finished at ${latestPresyncSlotHeight}`);
-  }
 }
 
 async function getPresyncStartBlockheight(
   gameStateMachine: GameStateMachine,
   CDEs: ChainDataExtension[],
   maximumPresyncBlockheight: number
-): Promise<{ [network: number]: number }> {
+): Promise<number> {
   const earliestCdeSbh = getEarliestStartBlockheight(CDEs);
   const freshPresyncStart = earliestCdeSbh >= 0 ? earliestCdeSbh : maximumPresyncBlockheight + 1;
 
-  const earliestCdeCardanoSlot = getEarliestStartSlot(CDEs);
-
   const latestPresyncBlockheight = await gameStateMachine.getPresyncBlockHeight();
-  const latestPresyncSlotHeight = await gameStateMachine.getPresyncCardanoSlotHeight();
-
-  const result = { [Network.EVM]: freshPresyncStart, [Network.CARDANO]: earliestCdeCardanoSlot };
 
   if (latestPresyncBlockheight > 0) {
-    result[Network.EVM] = latestPresyncBlockheight + 1;
+    return latestPresyncBlockheight + 1;
   }
 
-  if (latestPresyncSlotHeight > 0) {
-    result[Network.CARDANO] = latestPresyncSlotHeight + 1;
-  }
-
-  return result;
+  return freshPresyncStart;
 }
 
 async function runPresyncRound(
@@ -146,20 +118,23 @@ async function runPresyncRound(
   chainFunnel: ChainFunnel,
   pollingPeriod: number,
   from: ReadPresyncDataFrom
-): Promise<{ [network: number]: number }> {
+): Promise<number | undefined> {
   const latestPresyncDataList = await chainFunnel.readPresyncData(from);
 
   if (!latestPresyncDataList || Object.values(latestPresyncDataList).every(l => l.length === 0)) {
     await delay(pollingPeriod);
-    return Object.fromEntries(from.map(({ network, from }) => [network, from])) as Record<
-      Network,
-      number
-    >;
+
+    return from.from;
   }
+
+  const finished = Object.values(latestPresyncDataList).every(data => {
+    return data === FUNNEL_PRESYNC_FINISHED;
+  });
 
   const filteredPresyncDataList = Object.values(latestPresyncDataList)
     .flatMap(data => (data !== FUNNEL_PRESYNC_FINISHED ? data : []))
-    .filter(unit => unit.extensionDatums.length > 0);
+    // for cardano keep the empty list, used to update the slot range lower bound
+    .filter(unit => unit.network !== Network.EVM || unit.extensionDatums.length > 0);
 
   const dbTx = chainFunnel.getDbTx();
 
@@ -167,16 +142,15 @@ async function runPresyncRound(
     await gameStateMachine.presyncProcess(dbTx, presyncData);
   }
 
-  const cardanoFrom = from.find(arg => arg.network === Network.CARDANO);
-  if (cardanoFrom) {
-    await gameStateMachine.markCardanoPresyncMilestone(dbTx, cardanoFrom.to);
+  if (!finished) {
+    if (latestPresyncDataList[Network.EVM] === FUNNEL_PRESYNC_FINISHED) {
+      return Number.MAX_SAFE_INTEGER;
+    } else {
+      return from.to + 1;
+    }
+  } else {
+    return undefined;
   }
-
-  return Object.fromEntries(
-    from
-      .filter(arg => latestPresyncDataList[arg.network] !== FUNNEL_PRESYNC_FINISHED)
-      .map(arg => [arg.network, arg.to + 1])
-  );
 }
 
 async function runSync(

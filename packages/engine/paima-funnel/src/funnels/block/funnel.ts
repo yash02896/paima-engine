@@ -118,7 +118,7 @@ export class BlockFunnel extends BaseFunnel implements ChainFunnel {
         ),
         getUngroupedCdeData(this.sharedData.web3, this.sharedData.extensions, fromBlock, toBlock),
       ]);
-      const cdeData = groupCdeData(Network.CARDANO, fromBlock, toBlock, ungroupedCdeData);
+      const cdeData = groupCdeData(fromBlock, toBlock, ungroupedCdeData);
       return composeChainData(baseChainData, cdeData);
     } catch (err) {
       doLog(`[funnel] at ${fromBlock}-${toBlock} caught ${err}`);
@@ -127,14 +127,8 @@ export class BlockFunnel extends BaseFunnel implements ChainFunnel {
   };
 
   public override async readPresyncData(
-    args: ReadPresyncDataFrom
+    arg: ReadPresyncDataFrom
   ): Promise<{ [network: number]: PresyncChainData[] | typeof FUNNEL_PRESYNC_FINISHED }> {
-    let arg = args.find(arg => arg.network == Network.EVM);
-
-    if (!arg) {
-      return [];
-    }
-
     let fromBlock = arg.from;
     let toBlock = arg.to;
 
@@ -155,7 +149,7 @@ export class BlockFunnel extends BaseFunnel implements ChainFunnel {
         fromBlock,
         toBlock
       );
-      return { [Network.EVM]: groupCdeData(Network.EVM, fromBlock, toBlock, ungroupedCdeData) };
+      return { [Network.EVM]: groupCdeData(fromBlock, toBlock, ungroupedCdeData) };
     } catch (err) {
       doLog(`[paima-funnel::readPresyncData] Exception occurred while reading blocks: ${err}`);
       throw err;

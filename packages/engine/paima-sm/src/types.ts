@@ -32,11 +32,20 @@ export interface ChainData {
 export type InternalEvent = CardanoEpochEvent;
 export type CardanoEpochEvent = { type: InternalEventType.CardanoBestEpoch; epoch: number };
 
-export interface PresyncChainData {
-  network: Network;
+export interface EvmPresyncChainData {
+  network: Network.EVM;
   blockNumber: number;
   extensionDatums: ChainDataExtensionDatum[];
 }
+export interface CardanoPresyncChainData {
+  network: Network.CARDANO;
+  carpCursor:
+    | { kind: 'paginationCursor'; cdeId: number; cursor: string; finished: boolean }
+    | { kind: 'slot'; cdeId: number; slot: number; finished: boolean };
+  extensionDatums: ChainDataExtensionDatum[];
+}
+
+export type PresyncChainData = EvmPresyncChainData | CardanoPresyncChainData;
 
 interface CdeDatumErc20TransferPayload {
   from: string;
@@ -93,6 +102,11 @@ interface CdeDatumCardanoProjectedNFTPayload {
   plutusDatum: string;
 
   forHowLong: string | undefined;
+}
+
+interface CdeDatumCardanoTransferPayload {
+  txId: string;
+  rawTx: string;
 }
 
 type ChainDataExtensionPayload =
@@ -160,6 +174,13 @@ export interface CdeCardanoProjectedNFTDatum extends CdeDatumBase {
   scheduledPrefix: string | undefined;
 }
 
+export interface CdeCardanoTransferDatum extends CdeDatumBase {
+  cdeDatumType: ChainDataExtensionDatumType.CardanoTransfer;
+  payload: CdeDatumCardanoTransferPayload;
+  scheduledPrefix: string | undefined;
+  paginationCursor: { cursor: string; finished: boolean };
+}
+
 export type ChainDataExtensionDatum =
   | CdeErc20TransferDatum
   | CdeErc721MintDatum
@@ -168,6 +189,7 @@ export type ChainDataExtensionDatum =
   | CdeGenericDatum
   | CdeErc6551RegistryDatum
   | CdeCardanoPoolDatum
+  | CdeCardanoTransferDatum
   | CdeCardanoProjectedNFTDatum;
 
 export enum CdeEntryTypeName {
@@ -178,6 +200,7 @@ export enum CdeEntryTypeName {
   ERC6551Registry = 'erc6551-registry',
   CardanoDelegation = 'cardano-stake-delegation',
   CardanoProjectedNFT = 'cardano-projected-nft',
+  CardanoTransfer = 'cardano-transfer',
 }
 
 const EvmAddress = Type.Transform(Type.RegExp('0x[0-9a-fA-F]{40}'))
@@ -308,6 +331,20 @@ export type ChainDataExtensionCardanoProjectedNFT = ChainDataExtensionBase &
     cdeType: ChainDataExtensionType.CardanoProjectedNFT;
   };
 
+export const ChainDataExtensionCardanoTransferConfig = Type.Object({
+  type: Type.Literal(CdeEntryTypeName.CardanoTransfer),
+  credential: Type.String(),
+  scheduledPrefix: Type.String(),
+  startSlot: Type.Number(),
+  stopSlot: Type.Optional(Type.Number()),
+  name: Type.String(),
+});
+
+export type ChainDataExtensionCardanoTransfer = ChainDataExtensionBase &
+  Static<typeof ChainDataExtensionCardanoTransferConfig> & {
+    cdeType: ChainDataExtensionType.CardanoTransfer;
+  };
+
 export const CdeConfig = Type.Object({
   extensions: Type.Array(
     Type.Union([
@@ -318,6 +355,7 @@ export const CdeConfig = Type.Object({
       ChainDataExtensionErc6551RegistryConfig,
       ChainDataExtensionCardanoDelegationConfig,
       ChainDataExtensionCardanoProjectedNFTConfig,
+      ChainDataExtensionCardanoTransferConfig,
     ])
   ),
 });
@@ -343,7 +381,8 @@ export type ChainDataExtension =
   | ChainDataExtensionGeneric
   | ChainDataExtensionErc6551Registry
   | ChainDataExtensionCardanoDelegation
-  | ChainDataExtensionCardanoProjectedNFT;
+  | ChainDataExtensionCardanoProjectedNFT
+  | ChainDataExtensionCardanoTransfer;
 
 export type GameStateTransitionFunctionRouter = (
   blockHeight: number
@@ -371,13 +410,11 @@ export interface GameStateMachine {
   syncStarted: () => Promise<boolean>;
   latestProcessedBlockHeight: (dbTx?: PoolClient | Pool) => Promise<number>;
   getPresyncBlockHeight: (dbTx?: PoolClient | Pool) => Promise<number>;
-  getPresyncCardanoSlotHeight: (dbTx?: PoolClient | Pool) => Promise<number>;
   getReadonlyDbConn: () => Pool;
   getPersistentReadonlyDbConn: () => Client;
   getReadWriteDbConn: () => Pool;
   process: (dbTx: PoolClient, chainData: ChainData) => Promise<void>;
   presyncProcess: (dbTx: PoolClient, latestCdeData: PresyncChainData) => Promise<void>;
   markPresyncMilestone: (blockHeight: number) => Promise<void>;
-  markCardanoPresyncMilestone: (dbTx: PoolClient, slot: number) => Promise<void>;
   dryRun: (gameInput: string, userAddress: string) => Promise<boolean>;
 }
