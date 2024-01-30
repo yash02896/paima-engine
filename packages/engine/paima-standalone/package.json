@@ -30,7 +30,8 @@
       "./contracts/**/*",
       "./batcher/**/*",
       "./documentation/**/*",
-      "./swagger-ui/**/*"
+      "./swagger-ui/**/*",
+      "./cardano_multiplatform_lib_bg.wasm"
     ],
     "targets": [
       "node18-linux-x64",
